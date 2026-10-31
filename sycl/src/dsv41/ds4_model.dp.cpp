@@ -676,6 +676,13 @@ struct Chunk {
     int *bc_pin = nullptr, *bc_dev = nullptr;
     uint64_t n_batch = 0;
     double wait_ms = 0;                      // the compute waiting for a read
+    // (DS4_FLOW_STATS: wait_ms split - for io (wait_any) or for a staging slot's DMA (stage_ev); how far the reads ran
+    // ahead of the compute; why flow_pump stopped issuing reads: a staging slot still busy, nothing queued, a
+    // layer-major ordering wait)
+    double wait_io_ms = 0, wait_stage_ms = 0;
+    size_t ahead_max = 0, inflight_max = 0;
+    uint64_t pump_stage = 0, pump_empty = 0, pump_after = 0;
+    int stage_x = 1;                         // DS4_FLOW_STAGE: staging slots S = stage_x * ring_n (1: S = ring_n)
     // (DS4_PROF: where copy_ahead's time goes - the host staging copy, the DMA issues, the waits for a slot)
     double dbg_stage_ms = 0, dbg_dma_ms = 0, dbg_evt_ms = 0;
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
@@ -3043,6 +3050,23 @@ struct Model::Impl {
                     if (fl)   // (each part read unbuffered from its offset rounded down: a page more each)
                         cp->stage_stride = std::max(cp->stage_stride, flow_stride());
                     cp->S = cp->ring_n;
+                    // DS4_FLOW_STAGE=N (opt-in, default 1): the flow's staging gets N times the ring's slots.  Staging
+                    // is pinned host memory, not VRAM: the ring (VRAM) is unchanged.  More slots let the readers run
+                    // further ahead of the DMA and the compute (a read takes a staging slot until its DMA is done on
+                    // the GPU, and the DMA waits for the ring slot's last use).  The likely experts queued early are
+                    // capped at S + ring_n, so N > 1 queues more of them and changes the stream's order: the sums stay
+                    // independent of read timing but are not the same bits as N = 1.
+                    if (fl) {
+                        const char* sx = std::getenv("DS4_FLOW_STAGE");
+                        const int x = sx != nullptr ? std::atoi(sx) : 1;
+                        cp->stage_x = std::min(16, std::max(1, x));
+                        cp->S = cp->ring_n * cp->stage_x;
+                        if (cp->stage_x > 1)
+                            std::fprintf(stderr, "ds4: CUDA%d flow staging (DS4_FLOW_STAGE=%d): %d slots of %.1f MB, %.2f GB of "
+                                                 "pinned host RAM (ring: %d slots of %.1f MB in VRAM, unchanged)\n",
+                                         devs[di].id, cp->stage_x, cp->S, cp->stage_stride / 1e6,
+                                         (double) cp->S * (double) cp->stage_stride / 1e9, cp->ring_n, cp->ring_stride / 1e6);
+                    }
                     if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) return false;
                     cp->readers = std::make_unique<Pool>(n_readers - 1, std::vector<int>{}, 50);
                     if (!fl) continue;
@@ -3933,7 +3957,10 @@ struct Model::Impl {
                         ++c.lc_chk;
                     wait = c.lc_chk <= (size_t) it.after;
                 }
-                if (wait) break;
+                if (wait) {
+                    ++c.pump_after;
+                    break;
+                }
             }
             if (it.direct) {
                 const size_t R = (size_t) c.ring_n, r = c.n_read % R;
@@ -3969,9 +3996,15 @@ struct Model::Impl {
             } else if (it.stage >= 0) {
                 const int64_t prev = c.stage_item[(size_t) it.stage];
                 if (prev >= 0) {
-                    if ((size_t) prev >= c.n_dma) break;
+                    if ((size_t) prev >= c.n_dma) {
+                        ++c.pump_stage;
+                        break;
+                    }
                     const cudaError_t q = cudaEventQuery(c.stage_ev[(size_t) it.stage]);
-                    if (q == cudaErrorNotReady) break;
+                    if (q == cudaErrorNotReady) {
+                        ++c.pump_stage;
+                        break;
+                    }
                     CK(q);
                 }
                 c.stage_item[(size_t) it.stage] = (int64_t) c.n_read;
@@ -4012,6 +4045,9 @@ struct Model::Impl {
             }
             ++c.n_read;
         }
+        if (c.n_read == end) ++c.pump_empty;
+        c.ahead_max = std::max(c.ahead_max, c.n_read - std::min(c.n_read, c.n_comp));
+        c.inflight_max = std::max(c.inflight_max, c.n_read - std::min(c.n_read, c.n_dma));
         const size_t R = (size_t) c.ring_n, dma0 = c.n_dma;
         struct Kick {   // (every way out: what was queued is submitted)
             cudaStream_t s;
@@ -4079,12 +4115,15 @@ struct Model::Impl {
             if (c.n_dma < i1) {   // not all of the batch landed: wait for a read, or for a staging slot's copy
                 const double tw = now_ms();
                 kick(s);
-                if (c.n_read > c.n_dma) c.io->wait_any(500);
+                const bool on_io = c.n_read > c.n_dma;
+                if (on_io) c.io->wait_any(500);
                 else {
                     const Chunk::Item& it = fit(c, c.n_read);
                     if (it.stage >= 0) CK(cudaEventSynchronize(c.stage_ev[(size_t) it.stage]));
                 }
-                c.wait_ms += now_ms() - tw;
+                const double dw = now_ms() - tw;
+                c.wait_ms += dw;
+                (on_io ? c.wait_io_ms : c.wait_stage_ms) += dw;
                 continue;
             }
             const int n = (int) (i1 - i0);
@@ -8577,7 +8616,9 @@ struct Model::Impl {
             c.fl_cut_k = run.cut_k;
             c.fl_cut_r = run.cut_r;
             c.spec_k = c.spec_il = -1;
-            c.wait_ms = 0;
+            c.wait_ms = c.wait_io_ms = c.wait_stage_ms = 0;
+            c.ahead_max = c.inflight_max = 0;
+            c.pump_stage = c.pump_empty = c.pump_after = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
             c.lc_il = -1;
             c.lc_used = 0;
@@ -9378,6 +9419,15 @@ struct Model::Impl {
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
                              (unsigned long long) c.it_spec_unused, c.wait_ms, dbgs);
+                std::fprintf(stderr,
+                             "ds4 prompt flow, CUDA%d: ring %d slots (%.1f MB each), staging %d slots (DS4_FLOW_STAGE=%d, %.2f GB "
+                             "host); waits: %.0f ms on io, %.0f ms on a staging slot's DMA; reads ahead of the compute max %zu "
+                             "items, read issued but not yet DMA'd max %zu; read issue stopped: staging slot busy %llu, nothing queued "
+                             "%llu, layer-major order %llu\n",
+                             devs[di].id, c.ring_n, c.ring_stride / 1e6, c.S, c.stage_x,
+                             (double) c.S * (double) c.stage_stride / 1e9, c.wait_io_ms, c.wait_stage_ms, c.ahead_max,
+                             c.inflight_max, (unsigned long long) c.pump_stage, (unsigned long long) c.pump_empty,
+                             (unsigned long long) c.pump_after);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
