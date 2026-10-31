@@ -11,6 +11,7 @@
 //   phase 2: block (head, query): merge the chunks and the sink.
 // Plain C++ (no PTX), shuffles and shared memory only: the HIP port is a rename.
 #pragma once
+#include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_kernels.cuh"
 #include "ds4_numerics.cuh"
 #include <cuda_fp16.h>

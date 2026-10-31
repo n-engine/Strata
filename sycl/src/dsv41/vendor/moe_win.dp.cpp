@@ -1,7 +1,9 @@
-// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT).
-// Ported into Strata for Intel Arc Pro B70 (Xe2 / bmg-g31).
-// sycl/src/dsv41/vendor/moe_win.dp.cpp - the window's expert grouping kernel.
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
+// Ported to SYCL for Intel Arc (sycl/src/dsv41/vendor/moe_win.dp.cpp, from src/dsv41/vendor/moe_win.cu) - the window's
+// expert grouping kernel.  Extracted from Project Maya's src/kernels/cuda/glm_fast.cu (MIT, see third_party/project-maya/NOTICE.md).
 #include "ds4_sycl.hpp"
+#include "../ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "strata/dsv41/moe_win.hpp"
 #include <cstdio>
 #include <cstdlib>

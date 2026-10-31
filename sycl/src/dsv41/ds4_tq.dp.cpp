@@ -11,6 +11,7 @@
 // 15-bit states are one 128-bit window of the stream (the tile code of tools/dsv41_lab/wmma_emu.hpp, checked there against a
 // double reference and on the card by tests/dsv41/tqw_hip_test.cpp).  Elsewhere the same lane mapping in plain FMAs.
 #include "ds4_sycl.hpp"
+#include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_iq.cuh"
 
 #include "ggml-common-tq.h"   // tq_lut_f16 (the 2048-point codebook as fp16 bit patterns, __device__)

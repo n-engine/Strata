@@ -1,9 +1,16 @@
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
 // Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf.cu - a GGUF's BF16 matrices and MXFP4 experts on the device (see ds4_gguf.cuh).
+#include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_gguf.cuh"
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 
 #include "ds4_iq.cuh"
+#if defined(STRATA_METAL)
+#include "ds4_gguf_cpu.hpp"   // gg_row_to_bf16 (the DS4_DBG_IQ check)
+#endif
 #include "ds4_numerics.cuh"
 
 #include "ds4_sycl.hpp"
@@ -195,7 +202,75 @@ __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restr
 }
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
+#if defined(STRATA_METAL)
+    if (::strata::dsv41::metal_host::q8_quant_rows(x, ldx, rows, k, (int8_t*) q, d)) return;
+#endif
     STRATA_LAUNCH(s, grid, kThreads, 0, q8_quant_kernel, x, ldx, k, q, d);
+}
+
+// Several activations' rounding in one launch (a GEMV call's jobs: wo_a's eight groups, the shared expert's two, ...): item z is
+// q8_quant's (x, ldx, rows, k, q, d), the same per-element arithmetic, so the bytes are the single launches'.  Identical items
+// (the same x, stride, rows and k: two matrices reading one input) are rounded once and share the result.
+constexpr int kQuantItems = x3::kMaxMvJobs;
+struct QuantItems {
+    const float* x[kQuantItems];
+    size_t ldx[kQuantItems];
+    int k[kQuantItems], rows[kQuantItems];
+    int8_t* q[kQuantItems];
+    float* d[kQuantItems];
+    int n;
+};
+__global__ void __launch_bounds__(kThreads) q8_quant_multi_kernel(QuantItems it) {
+    const int z = blockIdx.z;
+    if (z >= it.n) return;
+    const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int k = it.k[z];
+    if (r >= it.rows[z] || b * 32 >= k) return;
+    const float v = it.x[z][(size_t) r * it.ldx[z] + (size_t) b * 32 + lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    it.q[z][(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) it.d[z][(size_t) r * (k / 32) + b] = sc;
+}
+// adds an item unless an identical one is queued; returns the item whose result to read (its q and d)
+int quant_add(QuantItems& it, const float* x, size_t ldx, int rows, int k, int8_t* q, float* d) {
+    static const bool nodedup = std::getenv("DS4_QUANT_NODEDUP") != nullptr;
+    for (int i = 0; i < it.n && !nodedup; ++i)
+        if (it.x[i] == x && it.ldx[i] == ldx && it.rows[i] == rows && it.k[i] == k) return i;
+    const int i = it.n++;
+    it.x[i] = x;
+    it.ldx[i] = ldx;
+    it.rows[i] = rows;
+    it.k[i] = k;
+    it.q[i] = q;
+    it.d[i] = d;
+    return i;
+}
+void quant_flush(const QuantItems& it, cudaStream_t s) {
+    if (it.n <= 0) return;
+    static const bool single = std::getenv("DS4_QUANT_SINGLE") != nullptr;
+#if defined(STRATA_METAL)
+    if (!single && std::getenv("DS4_NO_Q8_BATCH") == nullptr) {   // the call's roundings in one dispatch (a dispatch a job was 45% of the decode token's)
+        struct Spec { const float* x; uint64_t ldx; uint32_t rows, k; int8_t* q; float* d; } sp[kQuantItems];
+        for (int i = 0; i < it.n; ++i) sp[i] = Spec{it.x[i], (uint64_t) it.ldx[i], (uint32_t) it.rows[i], (uint32_t) it.k[i], it.q[i], it.d[i]};
+        if (::strata::dsv41::metal_host::q8_quant_multi(sp, it.n)) return;
+    }
+    for (int i = 0; i < it.n; ++i) q8_quant(it.x[i], it.ldx[i], it.rows[i], it.k[i], it.q[i], it.d[i], s);
+    return;
+#endif
+    if (single) {
+        for (int i = 0; i < it.n; ++i) q8_quant(it.x[i], it.ldx[i], it.rows[i], it.k[i], it.q[i], it.d[i], s);
+        return;
+    }
+    int kmax = 0, rmax = 0;
+    for (int i = 0; i < it.n; ++i) {
+        kmax = std::max(kmax, it.k[i]);
+        rmax = std::max(rmax, it.rows[i]);
+    }
+    const dim3 grid((unsigned) ((kmax / 32 + kWarps - 1) / kWarps), (unsigned) rmax, (unsigned) it.n);
+    STRATA_LAUNCH(s, grid, kThreads, 0, q8_quant_multi_kernel, it);
 }
 
 // 8 E2M1 codes (a word of 4 code bytes) -> their values as int8: .x the low nibbles' (values 0..3 of the word's bytes),
@@ -980,6 +1055,17 @@ size_t type_row_bytes(int type, int64_t k) {
 int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::known(type) ? iq::block_values(type) : 0; }
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
 bool type_on_device(int type) { return type == kTypeMXFP4 || iq::supported(type); }
+bool type_on_chunk(int type) {
+#if defined(STRATA_METAL)
+    // ds4_mm.metal instantiates the tile GEMM for IQ2_XXS / IQ2_XS / IQ2_S only; IQ1_M (the 2.00 bpw pack's type) has
+    // the matvec kernel but no tile one, so a chunked prompt would stop in "kernel launch with no Metal dispatch".
+    if (type == iq::kIQ1_S || type == iq::kIQ4_NL) return false;   // (IQ1_M: the tile kernels since DS4_MM_INST(29) and iq_bs)
+    return type_on_device(type);
+#else
+    (void) type;
+    return true;   // CUDA and HIP: the chunk path takes whatever the layer holds (types with no GPU kernel stay on the CPU lane)
+#endif
+}
 
 namespace {
 size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, a low-bit type) a row
@@ -1012,14 +1098,28 @@ template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (f == 1) {
+#if defined(STRATA_METAL)
+        // the MXFP4 matvec: the engine's jobs go across as they are (same layout on both sides)
+        if (max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 1)) return;
+#endif
         if (vec) STRATA_LAUNCH(s, grid, kThreads, 0, (mx_mv_kernel<NC, true, false>), J);
-        else     STRATA_LAUNCH(s, grid, kThreads, 0, (mx_mv_kernel<NC, false, false>), J);
+        else STRATA_LAUNCH(s, grid, kThreads, 0, (mx_mv_kernel<NC, false, false>), J);
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
+#if defined(STRATA_METAL)
+        if (max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 2)) return;
+#endif
         if (vec) STRATA_LAUNCH(s, grid, kThreads, 0, (q8_mv_kernel<NC, true>), J);
-        else     STRATA_LAUNCH(s, grid, kThreads, 0, (q8_mv_kernel<NC, false>), J);
+        else STRATA_LAUNCH(s, grid, kThreads, 0, (q8_mv_kernel<NC, false>), J);
     } else {
+#if defined(STRATA_METAL)
+        // the BF16 matvec (vec: the rows and activations 16-byte aligned, so the 8-value step is safe)
+        if (vec && max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 0)) return;
+#endif
         if (vec) STRATA_LAUNCH(s, grid, kThreads, 0, (bf16_mv_kernel<NC, true>), J);
-        else     STRATA_LAUNCH(s, grid, kThreads, 0, (bf16_mv_kernel<NC, false>), J);
+        else STRATA_LAUNCH(s, grid, kThreads, 0, (bf16_mv_kernel<NC, false>), J);
     }
 }
 void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
@@ -1044,24 +1144,46 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
 
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
+#if defined(STRATA_METAL)
+    if (ds4_dbg("DS4_MV_LOG")) {   // how the engine batches its matvec jobs (one call = one quantiser dispatch)
+        static std::atomic<unsigned long long> calls{0}, jobsum{0};
+        static std::atomic<unsigned long long> hist[9];
+        static std::atomic<int> seen{0};
+        calls.fetch_add(1); jobsum.fetch_add((unsigned long long) n);
+        hist[n < 8 ? n : 8].fetch_add(1);
+        if (seen.fetch_add(1) % 256 == 255)
+            std::fprintf(stderr, "mvlog calls=%llu jobs=%llu avg=%.2f hist1..4=%llu,%llu,%llu,%llu 5+=%llu,%llu,%llu,%llu\n",
+                         (unsigned long long) calls.load(), (unsigned long long) jobsum.load(),
+                         (double) jobsum.load() / (double) calls.load(),
+                         (unsigned long long) hist[1].load(), (unsigned long long) hist[2].load(),
+                         (unsigned long long) hist[3].load(), (unsigned long long) hist[4].load(),
+                         (unsigned long long) hist[5].load(), (unsigned long long) hist[6].load(),
+                         (unsigned long long) hist[7].load(), (unsigned long long) hist[8].load());
+    }
+#endif
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
+    QuantItems QI;   // the int8 roundings of this call's jobs, one launch (identical inputs once)
+    QI.n = 0;
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
         if (m.fmt == kFmtGG) {   // the activations rounded to int8 (job i's rows of the scratch), then ds4_iq's GEMV
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.raw == nullptr || q.xf == nullptr || q.y == nullptr || q.ncol < 1 ||
-                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
+#if !defined(STRATA_METAL)
+                q.ncol > x3::kMaxMvCols ||
+#endif
+                m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
                 std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.K), m.k, m.n);
                 g_errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            const int qi = quant_add(QI, q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1069,8 +1191,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
+            b.xq = QI.q[qi];
+            b.xd = QI.d[qi];
             b.y = q.y;
             b.ycs = q.y_cs;
             b.bias = q.bias;
@@ -1108,24 +1230,80 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            const int qi = quant_add(QI, q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
+            b.xq = QI.q[qi];
+            b.xd = QI.d[qi];
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+    quant_flush(QI, s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+#if defined(STRATA_METAL)
+    if (ds4_dbg("DS4_DBG_Q8") && nj[2] > 0) {   // DBG: the Q8_0 matvec's first job against a host recompute
+        ds4_metal_flush();
+        const BfJob& b = J[2].j[0];
+        const uint8_t* w = (const uint8_t*) strata::gpu::host_view(b.w);
+        const int8_t* xq = (const int8_t*) strata::gpu::host_view(b.xq);
+        const float* xd = (const float*) strata::gpu::host_view(b.xd);
+        const float* y = (const float*) strata::gpu::host_view(b.y);
+        const float* xf = (const float*) strata::gpu::host_view(b.x);
+        for (int c = 0; c < std::min(b.ncol, 2); ++c)
+            for (int r = 0; r < 2; ++r) {
+                double acc = 0.0, accf = 0.0;
+                for (int kb = 0; kb < b.k / 32; ++kb) {
+                    const uint8_t* p = w + (size_t) r * b.ld + (size_t) kb * 34;
+                    uint16_t dh;
+                    std::memcpy(&dh, p, 2);
+                    float dw = __half2float(*(const __half*) &dh);
+                    int sum = 0;
+                    for (int j = 0; j < 32; ++j) sum += (int) (int8_t) p[2 + j] * (int) xq[(size_t) c * b.k + kb * 32 + j];
+                    acc += (double) dw * xd[(size_t) c * (b.k / 32) + kb] * sum;
+                    for (int j = 0; j < 32; ++j) accf += (double) dw * (int) (int8_t) p[2 + j] * xf[(size_t) c * b.xcs + kb * 32 + j];
+                }
+                std::fprintf(stderr, "DBG q8 job0 k=%d n=%d ncol=%d ld=%zu xcs=%zu c=%d r=%d recompute=%.5g exactf=%.5g kernel_y=%.5g xd0=%g xq0=%d\n", b.k, b.n, b.ncol,
+                             b.ld, b.xcs, c, r, acc, accf, y[(size_t) c * b.ycs + r], xd[(size_t) c * (b.k / 32)], (int) xq[(size_t) c * b.k]);
+            }
+    }
+#endif
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
         return false;
     }
+#if defined(STRATA_METAL)
+    if (ds4_dbg("DS4_DBG_IQ") && nij > 0) {   // DBG: the low-bit matvec's first job against a host decode of its rows
+        ds4_metal_flush();
+        for (int ji = 0; ji < std::min(nij, 2); ++ji) {
+            const iq::MvJob& b = IJ[ji];
+            const uint8_t* w = (const uint8_t*) strata::gpu::host_view(b.w);
+            const int8_t* xq = (const int8_t*) strata::gpu::host_view(b.xq);
+            const float* xd = (const float*) strata::gpu::host_view(b.xd);
+            const float* y = (const float*) strata::gpu::host_view(b.y);
+            std::vector<uint16_t> row((size_t) b.k);
+            for (int r = 0; r < 3; ++r) {
+                if (!gg_row_to_bf16(b.type, w + (size_t) r * b.ld, b.k, row.data())) { std::fprintf(stderr, "DBG iq: no host decode for type %d\n", b.type); break; }
+                double acc = 0.0;
+                for (int i = 0; i < b.k; ++i) {
+                    uint32_t u = (uint32_t) row[(size_t) i] << 16; float wf; std::memcpy(&wf, &u, 4);
+                    acc += (double) wf * xq[i] * xd[i / 32];
+                }
+                std::fprintf(stderr, "DBG iq job %d type %d k=%d n=%d ncol=%d ld=%zu r=%d host=%.5g kernel=%.5g w=%p\n", ji, b.type, b.k, b.n, b.ncol, b.ld, r, acc, y[r], (const void*) b.w);
+            }
+        }
+    }
+#endif
     check("mv");
     return true;
 }
 
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (!bf16 && m.raw != nullptr) {   // the prompt chunk's dense matrices: F16 rows for the MPP GEMM
+        const int kind = m.fmt == kFmtGG ? m.K : m.fmt == kFmtQ8_0 ? 8 : m.fmt == kFmtBF16 ? 0 : -1;
+        if (kind >= 0 && ::strata::dsv41::metal_host::dequant_rows(kind, m.raw, row_stride(m), m.k, m.n, dst)) return;
+    }
+#endif
     if (m.fmt == kFmtGG && m.raw != nullptr) {   // a K-quant / i-quant dense matrix (the IST-DAS sets' Q5_K): its own dequantizer
         if (!iq::dequant_rows(m.K, m.raw, row_stride(m), m.k, m.n, dst, bf16, s)) fail("rows: a low-bit type not covered");
         return;
@@ -1199,6 +1377,14 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     m.xq = sc->xq;
     m.xd = sc->xd;
     q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
+#if defined(STRATA_METAL)
+    // mx_gate_up_kernel on the Metal dispatch (the MXFP4 expert GEMM); the launch below is the fallback
+    if (::strata::dsv41::metal_host::mx_gu(a.plan_ptr, nullptr, nullptr, nullptr, nullptr, a.lay.trellis, a.n_embd,
+                                           a.n_ff, a.limit, sc->xq, sc->xd, h, a.k)) {
+        check("moe_gate_up");
+        return;
+    }
+#endif
     launch_groups<GateUpK>(m, a.n_ff, a.k, 1, s);
     check("moe_gate_up");
 }
@@ -1223,7 +1409,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
         ia.hd = sc->hd;
         iq::down(ia, a.k, 1, s);
     } else {
-        launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
+#if defined(STRATA_METAL)
+        // mx_down_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_dn(a.plan_ptr, nullptr, nullptr, nullptr, nullptr, a.lay.trellis, a.n_embd,
+                                                a.n_ff, sc->hq, sc->hd, sc->part, a.k))
+#endif
+            launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
@@ -1237,6 +1428,10 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
+#if defined(STRATA_METAL)
+    if (!::strata::dsv41::metal_host::mx_combine(c.plan_ptr, c.plan_w, c.part, c.cpu_part, c.cpu_stride,
+                                                 c.cpu_flag, c.sh_out, c.out, c.out_stride, 1, c.k, c.n_embd))
+#endif
     STRATA_LAUNCH(s, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, mx_combine_kernel, c);
     check("moe_down");
 }
@@ -1279,12 +1474,31 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hd = sc->hd;
     }
     q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
-    if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
-    else iq::gate_up(ia, groups, a.T, s);
+    if (mx) {
+#if defined(STRATA_METAL)
+        // mx_gate_up_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_gu(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups,
+                                                a.lay.trellis, a.n_embd, a.n_ff, a.limit, sc->xq, sc->xd, a.h, groups))
+#endif
+            launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+    } else {
+        iq::gate_up(ia, groups, a.T, s);
+    }
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
-    if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
-    else iq::down(ia, groups, a.T, s);
+    if (mx) {
+#if defined(STRATA_METAL)
+        // mx_down_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_dn(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups,
+                                                a.lay.trellis, a.n_embd, a.n_ff, sc->hq, sc->hd, a.part, groups))
+#endif
+            launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+    } else {
+        iq::down(ia, groups, a.T, s);
+    }
+#if !defined(STRATA_METAL)
+    // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)
     if (a.wait_ptr != nullptr) STRATA_LAUNCH(s, 1, 32, 0, mx_wait_kernel, a.wait_ptr, a.wait_val, ds4_spin_max(s));
+#endif
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1297,6 +1511,11 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
+#if defined(STRATA_METAL)
+    // mx_combine_kernel on the Metal dispatch; the launch below is the fallback
+    if (!::strata::dsv41::metal_host::mx_combine(c.plan_ptr, c.plan_w, c.part, c.cpu_part, c.cpu_stride,
+                                                 c.cpu_flag, c.sh_out, c.out, c.out_stride, a.T, c.k, c.n_embd))
+#endif
     STRATA_LAUNCH(s, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, mx_combine_kernel, c);
     check("win_experts");
     return true;
@@ -1315,6 +1534,12 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
     q.n_embd = sa.n_embd;
     q.n_ff = sa.n_ff;
     q.limit = sa.limit;
+    q.xf16 = sa.x16;
+    q.skip_ge = sa.skip_ge;
+#if defined(STRATA_METAL)
+    q.hbounds = sa.hbounds;
+    q.total_rows = sa.total_rows;
+#endif
     return q;
 }
 }  // namespace

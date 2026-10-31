@@ -10,6 +10,7 @@
 //       x[piece] += wo(O) + bias
 //     xn = norm2(x); per row piece: x += w2(silu(gate) * up), gate | up = w1(xn)
 //   xn = norm(x); the 3 x 3 unfold; GELU(w1 + b1); w2 + b2 -> BF16 rows (the aligner's weights stream in pieces too)
+#include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_vision.cuh"
 
 #include "ds4_sycl.hpp"

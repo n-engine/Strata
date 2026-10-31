@@ -20,6 +20,10 @@
 // below): this file's CUDA-core fallback was slower there (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  The
 // prompt path below is this file's on every GPU.
 #include "ds4_sycl.hpp"
+#include "../ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 #include "strata/dsv41/exl3.hpp"
 
 #include <algorithm>
@@ -1263,7 +1267,10 @@ int sm_count() {
 // token path and the verify windows take the same family on a device, so a window stays bit for bit its token path.
 // Asked once per device.
 bool use_legacy() {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_METAL)
+    // HIP has no v1.1.8 kernels.  Metal has neither them nor a compute capability to ask for: the shim answers
+    // cudaDeviceGetAttribute with an error, so `major` stayed 0 and every Metal run without STRATA_GLM_EXL3_DECODE=new
+    // took this branch and aborted in exl3::legacy::prepare's stub.  The 2.25 bpw pack never uses EXL3.
     return false;
 #else
     static std::atomic<int> cache[64];   // 0 not asked, 1 v1.1.8's kernels, 2 this file's
@@ -1725,8 +1732,11 @@ void rows_rot_out(float* y, int ldy, int nrows, int ncols, const uint16_t* svh, 
 
 void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out, cudaStream_t s) {
     if (nrows <= 0) return;
+#if defined(STRATA_METAL)
+    if (::strata::dsv41::metal_host::rows_f16(x, ldx, idx, nrows, ncols, out)) return;
+#endif
     STRATA_LAUNCH(s, dim3((unsigned) std::min(8, (ncols + 255) / 256), (unsigned) nrows), 256, 0, rows_f16_kernel, x, ldx, idx,
-                  ncols, out);
+                                                                                                         ncols, out);
     launch_check("rows_f16");
 }
 
