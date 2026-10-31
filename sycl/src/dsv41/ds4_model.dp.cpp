@@ -76,6 +76,11 @@ namespace kc = strata::dsv41k::cpu;
 namespace gf = strata::dsv41k::glmf;
 namespace gg = strata::ds4::gguf;
 
+// a flow wait's name for DS4_FLOW_WATCHDOG's report: what it waits for, and where
+#define DS4_FLOW_STR2(x) #x
+#define DS4_FLOW_STR(x) DS4_FLOW_STR2(x)
+#define DS4_FLOW_AT(what) what " (ds4_model.dp.cpp:" DS4_FLOW_STR(__LINE__) ")"
+
 #define CK(call)                                                                            \
     do {                                                                                    \
         cudaError_t e_ = (call);                                                            \
@@ -683,6 +688,10 @@ struct Chunk {
     size_t ahead_max = 0, inflight_max = 0;
     uint64_t pump_stage = 0, pump_empty = 0, pump_after = 0;
     int stage_x = 1;                         // DS4_FLOW_STAGE: staging slots S = stage_x * ring_n (1: S = ring_n)
+    // (DS4_FLOW_POLL=2: staging slot st's last DMA done as a sequence number - its item + 1 - the copy stream writes into
+    // page-locked host memory after the DMA, stage_done[st]; stage_src[st] the value the copy reads.  The host polls it
+    // instead of waiting on stage_ev.  nullptr: off)
+    uint64_t *stage_done = nullptr, *stage_src = nullptr;
     // (DS4_PROF: where copy_ahead's time goes - the host staging copy, the DMA issues, the waits for a slot)
     double dbg_stage_ms = 0, dbg_dma_ms = 0, dbg_evt_ms = 0;
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
@@ -3083,6 +3092,12 @@ struct Model::Impl {
                     cp->ring_free.resize((size_t) cp->ring_n);
                     for (auto* v : {&cp->stage_ev, &cp->ring_fill, &cp->ring_free})
                         for (cudaEvent_t& e : *v) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+                    if (flow_poll() == 2) {   // (DS4_FLOW_POLL=2: the staging slots' DMA sequence numbers, Chunk::stage_done)
+                        if (!halloc(cp->stage_done, (size_t) cp->S, err) || !halloc(cp->stage_src, (size_t) cp->S, err))
+                            return false;
+                        std::memset(cp->stage_done, 0, (size_t) cp->S * sizeof(uint64_t));
+                        std::memset(cp->stage_src, 0, (size_t) cp->S * sizeof(uint64_t));
+                    }
                     // (a region is written again only bc_n batches later - more than a layer's items, so after that
                     // layer's bounds wait, which every copy from it precedes)
                     cp->bc_n = n_exp_max + 2;
@@ -3743,6 +3758,83 @@ struct Model::Impl {
     // the flow's copies and the compute it queued between its waits are submitted at once (win_submit); elsewhere
     // nothing.  (CUDA too since #303: two RTX 3080s hung before the first layer, one GPU spinning on the other's flow)
     static void kick(cudaStream_t s) { win_submit(s); }
+    // How the flow's host waits for the GPU (opt-in diagnostics; unset: a blocking event wait, as before).
+    // DS4_FLOW_POLL=1: the event queried with a short sleep between queries instead of a blocking wait.  =2: a staging
+    // slot's DMA is a sequence number the copy stream writes into page-locked host memory (Chunk::stage_done), polled -
+    // no host thread waits on a queue's event, as the Qwen port's Stager (docs/INTEL.md, "Stager and PLE waits").
+    // DS4_FLOW_WATCHDOG=SECONDS: a flow wait longer than that prints once which wait it is, the stream's counters and its
+    // events' states, then keeps waiting (it polls as =1 where it would block).  2026-10-31, B60: a 9352-token prompt
+    // hung in 6 runs of 11, the worker in flow_layer's blocking wait (xe_wait_user_fence) and the engines idle.
+    static int flow_poll() {
+        static const int v = std::getenv("DS4_FLOW_POLL") != nullptr ? std::atoi(std::getenv("DS4_FLOW_POLL")) : 0;
+        return v;
+    }
+    static double flow_watchdog() {
+        static const double v = std::getenv("DS4_FLOW_WATCHDOG") != nullptr ? std::atof(std::getenv("DS4_FLOW_WATCHDOG")) : 0.0;
+        return v;
+    }
+    // staging slot st's last DMA (of item stage_item[st]) done: cudaSuccess or cudaErrorNotReady (an error otherwise)
+    static cudaError_t flow_stage_query(const Chunk& c, int st) {
+        if (c.stage_done != nullptr) {
+            const int64_t prev = c.stage_item[(size_t) st];
+            return prev < 0 || *(volatile const uint64_t*) (c.stage_done + st) >= (uint64_t) prev + 1 ? cudaSuccess
+                                                                                                         : cudaErrorNotReady;
+        }
+        return cudaEventQuery(c.stage_ev[(size_t) st]);
+    }
+    static const char* flow_ev_state(cudaEvent_t e) {
+        if (e == nullptr) return "none";
+        const cudaError_t q = cudaEventQuery(e);
+        return q == cudaSuccess ? "done" : q == cudaErrorNotReady ? "PENDING" : "error";
+    }
+    // the watchdog's report: the wait, the stream's counters, the events around it (DS4_FLOW_WATCHDOG)
+    void flow_tell(const Chunk& c, const char* tag, int il, int k, int st, cudaStream_t s, double waited_ms) const {
+        const size_t R = (size_t) c.ring_n;
+        const int64_t prev = st >= 0 ? c.stage_item[(size_t) st] : -1;
+        char sd[64] = "";
+        if (st >= 0 && c.stage_done != nullptr)
+            std::snprintf(sd, sizeof sd, ", stage_done %llu", (unsigned long long) *(volatile const uint64_t*) (c.stage_done + st));
+        std::fprintf(stderr,
+                     "ds4: FLOW WATCHDOG (DS4_FLOW_WATCHDOG=%g): %s waiting %.1f s - CUDA%d layer %d chunk %d; n_read %zu "
+                     "n_dma %zu n_comp %zu n_batch %llu base %zu items %zu; stage %d (S %d, its item %lld%s)\n",
+                     flow_watchdog(), tag, waited_ms / 1000.0, devs[(size_t) c.dev].id, il, k, c.n_read, c.n_dma, c.n_comp,
+                     (unsigned long long) c.n_batch, c.base, c.items.size(), st, c.S, (long long) prev, sd);
+        std::fprintf(stderr, "ds4: FLOW WATCHDOG events:");
+        if (st >= 0) std::fprintf(stderr, " stage_ev[%d] %s", st, flow_ev_state(c.stage_ev[(size_t) st]));
+        if (prev >= 0)   // (what the item's DMA waited for on the copy stream, and its own fill)
+            std::fprintf(stderr, " ring_free[%zu] %s ring_fill[%zu] %s", (size_t) prev % R,
+                         flow_ev_state(c.ring_free[(size_t) prev % R]), (size_t) prev % R,
+                         flow_ev_state(c.ring_fill[(size_t) prev % R]));
+        if (c.n_dma > 0)   // (the last DMA queued)
+            std::fprintf(stderr, " last-dma ring_fill[%zu] %s", (c.n_dma - 1) % R, flow_ev_state(c.ring_fill[(c.n_dma - 1) % R]));
+        if (c.n_comp > 0)   // (the last use queued)
+            std::fprintf(stderr, " last-use ring_free[%zu] %s", (c.n_comp - 1) % R, flow_ev_state(c.ring_free[(c.n_comp - 1) % R]));
+        std::fprintf(stderr, "; copy stream %s, compute stream %s\n", cudaStreamQuery(c.cs) == cudaSuccess ? "idle" : "BUSY",
+                     s == nullptr ? "-" : cudaStreamQuery(s) == cudaSuccess ? "idle" : "BUSY");
+    }
+    // a flow host wait for the GPU: event ev done, or (st >= 0) staging slot st's last DMA (ev its stage_ev); tag names
+    // the wait (DS4_FLOW_POLL / DS4_FLOW_WATCHDOG, above; neither set: cudaEventSynchronize as before)
+    bool flow_wait(Chunk& c, cudaEvent_t ev, int st, const char* tag, int il, int k, cudaStream_t s, std::string& err) {
+        const double wd = flow_watchdog();
+        if (flow_poll() == 0 && wd <= 0) {
+            CK(cudaEventSynchronize(ev));
+            return true;
+        }
+        const double t0 = now_ms();
+        bool told = false;
+        for (;;) {
+            const cudaError_t q = st >= 0 ? flow_stage_query(c, st) : cudaEventQuery(ev);
+            if (q == cudaSuccess) break;
+            if (q != cudaErrorNotReady) CK(q);
+            if (wd > 0 && !told && now_ms() - t0 > wd * 1000.0) {
+                told = true;
+                flow_tell(c, tag, il, k, st, s, now_ms() - t0);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+        if (told) std::fprintf(stderr, "ds4: FLOW WATCHDOG: %s released after %.1f s\n", tag, (now_ms() - t0) / 1000.0);
+        return true;
+    }
     size_t flow_region(int r) const {   // a part's room in a staging slot (read from its offset rounded down)
         return ((flow_part[r] + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1)) + os::kDirectAlign;
     }
@@ -3966,7 +4058,8 @@ struct Model::Impl {
                 const size_t R = (size_t) c.ring_n, r = c.n_read % R;
                 if (c.n_read >= R) {   // the slot's last use has to be computed - and finished: the CPU writes it
                     if (c.n_comp <= c.n_read - R) break;
-                    CK(cudaEventSynchronize(c.ring_free[r]));
+                    if (!flow_wait(c, c.ring_free[r], -1, DS4_FLOW_AT("flow_pump ring_free (direct)"), it.il, it.k, nullptr, err))
+                        return false;
                 }
                 const Layer& l = L[(size_t) it.il];
 #if defined(STRATA_METAL)
@@ -4000,7 +4093,7 @@ struct Model::Impl {
                         ++c.pump_stage;
                         break;
                     }
-                    const cudaError_t q = cudaEventQuery(c.stage_ev[(size_t) it.stage]);
+                    const cudaError_t q = flow_stage_query(c, it.stage);
                     if (q == cudaErrorNotReady) {
                         ++c.pump_stage;
                         break;
@@ -4086,6 +4179,11 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, c.cs));
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
+            if (it.stage >= 0 && c.stage_done != nullptr) {   // (DS4_FLOW_POLL=2: the slot's sequence number after its DMA;
+                // stage_src[st] is written again only once the host saw this copy done - the slot's next read waits for it)
+                c.stage_src[(size_t) it.stage] = (uint64_t) c.n_dma + 1;
+                CK(cudaMemcpyAsync(c.stage_done + it.stage, c.stage_src + it.stage, sizeof(uint64_t), cudaMemcpyHostToHost, c.cs));
+            }
             c.stream_bytes += (double) unit(l);
             ++c.n_dma;
         }
@@ -4119,7 +4217,9 @@ struct Model::Impl {
                 if (on_io) c.io->wait_any(500);
                 else {
                     const Chunk::Item& it = fit(c, c.n_read);
-                    if (it.stage >= 0) CK(cudaEventSynchronize(c.stage_ev[(size_t) it.stage]));
+                    if (it.stage >= 0 &&
+                        !flow_wait(c, c.stage_ev[(size_t) it.stage], it.stage, DS4_FLOW_AT("flow_layer stage_ev"), L0.il, k, s, err))
+                        return false;
                 }
                 const double dw = now_ms() - tw;
                 c.wait_ms += dw;
