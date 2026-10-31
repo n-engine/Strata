@@ -107,6 +107,10 @@ bool set_down(const SetArgs& a, cudaStream_t s);
 /// count of matrix-core launches so far (both do nothing / return -1 where there are no such tiles; hipk_force returns whether this device has them)
 bool hipk_force(int mode);
 long long hipk_launches();
+/// Test hook for the SYCL build's XMX prompt tiles (DS4_XMX=1, ds4_xmx_parity): the set's GEMM tiles alone, as set_gate_up /
+/// set_down launch them after the light kernels (skip_le / skip_ge as given; no light kernels here).  xmx false: the FMA tiles
+/// (set_kernel), true: the XMX tiles.  false: nothing launched (a trellis type, a type or geometry not covered).
+bool set_tiles(const SetArgs& a, bool gate_up, bool xmx, cudaStream_t s);
 /// The busy experts' path (a prompt's experts of many rows): one expert's matrix - n rows of k values, row_bytes(k)
 /// apart - as FP16 rows (ldd apart), the values the tensor-core tiles multiply (their loader's, rounded to FP16 the same
 /// way), for the caller's GEMM: the tiles decode an expert's weights again for every 64 of its rows.

@@ -16,6 +16,9 @@
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
 
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -900,6 +903,202 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
 }
 #endif
 
+// ---------------------------------------------------------------- the prompt sets on Intel's XMX units (SYCL, DS4_XMX=1)
+// set_tc_kernel's arithmetic on joint_matrix: the same weights (deq8's F32 values rounded to F16), the same activations (gate /
+// up: the F32 rows rounded to F16; down: the F16 rows as they are), F32 accumulation, then the same epilogue (the F16 clamped
+// swiglu into h, or F32 into y) for the same rows of the same experts (bounds, row0, skip_le, skip_ge as set_tc_kernel reads
+// them).  Only the order of the F32 sums differs.
+//   A work-group: 8 sub-groups of 16 (Xe2's XMX width), BM = 128 rows x BN = 64 outputs, KS = 64 values of K a step (two
+//   32-value sub-blocks: each work item decodes 4 runs of 8 weights a matrix a step into local memory, straight into the B
+//   operand's packed layout, ext_intel_packed as the main engine's xmx::gemm_kernel stores it: element (k, n) of the step
+//   at [k / 2][n][k % 2]; the activations as row-major F16 rows, padded).  Sub-group (sgm, sgn) of a 4 x 2 grid owns rows
+//   [32 sgm, +32) x outputs [32 sgn, +32): 4 x 2 accumulators of 8 x 16 (joint_matrix 8x16x16, FP16 in, FP32 out) for the
+//   gate and as many for the up; the 8-row bands past the expert's last row skip their products.  256 GRF (sycl grf_size), the codebook in local memory as deq8 reads it.
+//   One BM for every set: the decode is the cost (an expert of 100 rows decodes its weights once, where 64-row tiles did it
+//   twice), and an expert of a few rows costs the same decode either way.
+namespace xmxs {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kSg = 16, kNsg = 8, kWg = kSg * kNsg;   // the sub-group the XMX units take, sub-groups a work-group
+constexpr int kBM = 128, kBN = 64, kKS = 64;          // rows, outputs, K a step
+constexpr int kMT = 4, kNT = 2;                        // 8-row A tiles, 16-output B tiles a sub-group
+constexpr int kLd = kKS + 8;                           // halves an A tile row (padded)
+constexpr int kLdB = 2 * kBN;                          // halves a B pair-row (k / 2): the packed layout
+static_assert((kBM / (kMT * 8)) * (kBN / (kNT * 16)) == kNsg, "the sub-groups cover the block");
+static_assert(kBM == kWg, "one source row a work item");
+constexpr int r16(int b) { return (b + 15) / 16 * 16; }
+template <int T> constexpr int kTabBytes = r16((Ty<T>::TAB > 0 ? Ty<T>::TAB : 1) * 4);
+template <int T> constexpr int kOffX = kTabBytes<T>;
+template <int T> constexpr int kOffWg = kOffX<T> + kBM * kLd * 2;
+template <int T> constexpr int kOffWu = kOffWg<T> + kKS * kBN * 2;
+template <int T, bool GU> constexpr int kOffSrc = kOffWu<T> + (GU ? kKS * kBN * 2 : 0);
+template <int T, bool GU> constexpr int kSlm = r16(kOffSrc<T, GU> + kBM * 4);
+static_assert(kNsg * 2 * 8 * 16 * 4 <= kBM * kLd * 2, "the epilogue's scratch fits the A tile");
+
+template <int T, bool GU>
+inline void body(const SetArgs& a, const sycl::nd_item<3>& it, uint8_t* slm) {
+    auto sg = it.get_sub_group();
+    const int e = (int) it.get_group(0);
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + (int) it.get_group(2) * kBM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
+    if (a.skip_ge > 0 && hi - lo >= a.skip_ge) return;   // (the caller's FP16 GEMMs')
+    uint32_t* tab = reinterpret_cast<uint32_t*>(slm);
+    sycl::half* xs = reinterpret_cast<sycl::half*>(slm + kOffX<T>);
+    sycl::half* wg = reinterpret_cast<sycl::half*>(slm + kOffWg<T>);
+    sycl::half* wu = reinterpret_cast<sycl::half*>(slm + kOffWu<T>);
+    int* src = reinterpret_cast<int*>(slm + kOffSrc<T, GU>);
+    load_tab<T>(tab);
+    const int nr = sycl::min(kBM, hi - r0);
+    const int c0 = (int) it.get_group(1) * kBN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GU ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const int lid = (int) it.get_local_id(2);
+    src[lid] = lid < nr ? (GU ? a.idx[r0 + lid] : r0 + lid) : -1;
+    it.barrier(sycl::access::fence_space::local_space);
+    const int sgid = (int) sg.get_group_linear_id(), ln = (int) sg.get_local_linear_id();
+    const int band = (sgid / (kBN / (kNT * 16))) * kMT * 8, col = (sgid % (kBN / (kNT * 16))) * kNT * 16;
+    const int live = nr - band;   // (rows of this sub-group's band that exist: its 8-row tiles i < live / 8 rounded up)
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> ag[kMT][kNT];
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> au[GU ? kMT : 1][GU ? kNT : 1];
+#pragma unroll
+    for (int i = 0; i < kMT; ++i)
+#pragma unroll
+        for (int j = 0; j < kNT; ++j) {
+            jm::joint_matrix_fill(sg, ag[i][j], 0.0f);
+            if constexpr (GU) jm::joint_matrix_fill(sg, au[i][j], 0.0f);
+        }
+    using H8 = sycl::vec<sycl::half, 8>;
+    for (int k0 = 0; k0 < K; k0 += kKS) {
+        const int kb0 = k0 / 32;
+        // B: weight row r of the block, run q (8 values) of the step: sub-block kb0 + q / 4, piece q % 4 (set_tc_kernel's
+        // loader), rounded to F16 as it rounds them; values k, k + 1 (k even) of row r as one word of pair-row k / 2 (adjacent
+        // work items: adjacent rows, adjacent words)
+        for (int v = lid; v < kBN * (kKS / 8); v += kWg) {
+            const int r = v % kBN, q = v / kBN;
+            float w8[8];
+            deq8<T>(blob + a.tr[GU ? 0 : 2] + (size_t) (c0 + r) * rb, kb0 + (q >> 2), q & 3, tab, w8);
+            uint32_t* dst = reinterpret_cast<uint32_t*>(wg) + (size_t) (q * 4) * kBN + r;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                dst[j * kBN] = (uint32_t) __half_as_ushort(__float2half_rn(w8[2 * j])) |
+                               (uint32_t) __half_as_ushort(__float2half_rn(w8[2 * j + 1])) << 16;
+            if constexpr (GU) {
+                deq8<T>(blob + a.tr[1] + (size_t) (c0 + r) * rb, kb0 + (q >> 2), q & 3, tab, w8);
+                dst = reinterpret_cast<uint32_t*>(wu) + (size_t) (q * 4) * kBN + r;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    dst[j * kBN] = (uint32_t) __half_as_ushort(__float2half_rn(w8[2 * j])) |
+                                   (uint32_t) __half_as_ushort(__float2half_rn(w8[2 * j + 1])) << 16;
+            }
+        }
+        // A: the block's rows (gate / up: x[idx[row]] F32 -> F16; down: the F16 rows), 0 past the expert's rows
+        for (int v = lid; v < kBM * (kKS / 8); v += kWg) {
+            const int r = v / (kKS / 8), q = v % (kKS / 8), sr = src[r];
+            H8 h(sycl::half(0.0f));
+            if (sr >= 0) {
+                const size_t at = (size_t) sr * a.ldx + (size_t) k0 + q * 8;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) h[j] = GU ? __float2half_rn(a.xf[at + j]) : __ushort_as_half(a.xh[at + j]);
+            }
+            *reinterpret_cast<H8*>(xs + r * kLd + q * 8) = h;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        if (live > 0) {   // (uniform in the sub-group)
+#pragma unroll
+            for (int kk = 0; kk < kKS; kk += 16) {
+                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am[kMT];
+#pragma unroll
+                for (int i = 0; i < kMT; ++i)
+                    if (i * 8 < live)
+                        jm::joint_matrix_load(sg, am[i],
+                            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                                xs + (band + i * 8) * kLd + kk), kLd);
+#pragma unroll
+                for (int j = 0; j < kNT; ++j) {
+                    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm;
+                    jm::joint_matrix_load(sg, bm,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            wg + (kk / 2) * kLdB + 2 * (col + j * 16)), kLdB);
+#pragma unroll
+                    for (int i = 0; i < kMT; ++i)
+                        if (i * 8 < live) jm::joint_matrix_mad(sg, ag[i][j], am[i], bm, ag[i][j]);
+                    if constexpr (GU) {
+                        jm::joint_matrix_load(sg, bm,
+                            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                                wu + (kk / 2) * kLdB + 2 * (col + j * 16)), kLdB);
+#pragma unroll
+                        for (int i = 0; i < kMT; ++i)
+                            if (i * 8 < live) jm::joint_matrix_mad(sg, au[i][j], am[i], bm, au[i][j]);
+                    }
+                }
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    // the epilogue: each accumulator through this sub-group's scratch (in the A tile, free now), a lane a column, 8 rows
+    float* sc = reinterpret_cast<float*>(xs) + sgid * (2 * 8 * 16);
+#pragma unroll
+    for (int i = 0; i < kMT; ++i) {
+        if (i * 8 >= live) continue;   // (uniform)
+#pragma unroll
+        for (int j = 0; j < kNT; ++j) {
+            jm::joint_matrix_store(sg, ag[i][j],
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sc), 16,
+                jm::layout::row_major);
+            if constexpr (GU)
+                jm::joint_matrix_store(sg, au[i][j],
+                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sc + 128),
+                    16, jm::layout::row_major);
+            sycl::group_barrier(sg);
+            const int c = c0 + col + j * 16 + ln;
+            for (int rr = 0; rr < 8; ++rr) {
+                const int r = band + i * 8 + rr;
+                if (r >= nr) break;
+                const size_t lr = (size_t) (r0 + r);
+                if constexpr (GU) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swiglu(sc[rr * 16 + ln], sc[128 + rr * 16 + ln], a.limit)));
+                else a.y[lr * a.ldo + c] = sc[rr * 16 + ln];
+            }
+            sycl::group_barrier(sg);
+        }
+    }
+}
+
+// false: not launched (a geometry these tiles do not take: the caller's FMA tiles then)
+template <int T, bool GU>
+bool launch(const SetArgs& a, cudaStream_t s) {
+    const int N = GU ? a.n_ff : a.n_embd, K = GU ? a.n_embd : a.n_ff;
+    if (N % kBN != 0 || K % kKS != 0 || a.max_rows <= 0 || a.n_exp <= 0) return false;
+    sycl::queue& q = *strata::q_of(s);
+    const size_t gx = (size_t) ((a.max_rows + kBM - 1) / kBM);
+    const sycl::nd_range<3> nd(sycl::range<3>((size_t) a.n_exp, (size_t) (N / kBN), gx * kWg), sycl::range<3>(1, 1, kWg));
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::uint4, 1> slm(sycl::range<1>(kSlm<T, GU> / 16), h);
+        auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+        h.parallel_for(nd, props, [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kSg)]] {
+            body<T, GU>(a, it, reinterpret_cast<uint8_t*>(&slm[0]));
+        });
+    });
+    return true;
+}
+}  // namespace xmxs
+
+// DS4_XMX=1: the prompt sets' GEMM tiles on the XMX units (xmxs above) instead of the FMA tiles (set_kernel).  Read once.
+bool xmx_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_XMX");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+// (the one line at the start of the program when it is on)
+const bool g_xmx_note = [] {
+    if (xmx_on())
+        std::fprintf(stderr, "ds4 iq: DS4_XMX=1: the prompt sets' expert tiles run on the XMX units (joint_matrix 8x16x16, "
+                             "FP16 in, FP32 accumulate; %dx%d tiles, sub-group %d)\n", xmxs::kBM, xmxs::kBN, xmxs::kSg);
+    return true;
+}();
+
 // ---------------------------------------------------------------- GEMVs
 constexpr int kMaxJobs = 8;
 struct Jobs {
@@ -1181,6 +1380,16 @@ void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     else launch_dn<T, 16>(a, groups, s);
 }
 #include "ds4_iq_hip.inc"
+// the FMA tiles (set_kernel): every device's fallback
+template <int T, bool GU>
+void launch_set_fma(const SetArgs& a, dim3 grid, cudaStream_t s) {
+    if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
+        grid.x = (unsigned) ((a.max_rows + 15) / 16);
+        STRATA_LAUNCH(s, grid, kThreads, 0, (set_kernel<T, GU, 16>), a);
+        return;
+    }
+    STRATA_LAUNCH(s, grid, kThreads, 0, (set_kernel<T, GU>), a);
+}
 template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
@@ -1192,12 +1401,8 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
         return;
     }
 #endif
-    if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
-        grid.x = (unsigned) ((a.max_rows + 15) / 16);
-        STRATA_LAUNCH(s, grid, kThreads, 0, (set_kernel<T, GU, 16>), a);
-        return;
-    }
-    STRATA_LAUNCH(s, grid, kThreads, 0, (set_kernel<T, GU>), a);
+    if (xmx_on() && xmxs::launch<T, GU>(a, s)) return;   // (SYCL, DS4_XMX=1: the XMX tiles)
+    launch_set_fma<T, GU>(a, grid, s);
 }
 // the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
 struct LightBuf {
@@ -1617,6 +1822,22 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     DS4_IQ_SWITCH(a.td, SD_)
 #undef SD_
     return true;
+}
+
+bool set_tiles(const SetArgs& a, bool gate_up, bool xmx, cudaStream_t s) {
+    const int t = gate_up ? a.tg : a.td, K = gate_up ? a.n_embd : a.n_ff, N = gate_up ? a.n_ff : a.n_embd;
+    if (is_tq(t) || K % 256 != 0 || N % BN != 0 || a.max_rows <= 0) return false;
+    const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (N / BN), (unsigned) a.n_exp);
+    bool ok = true;
+#define ST_(T)                                                                    \
+    if (gate_up) {                                                                \
+        if (xmx) ok = xmxs::launch<T, true>(a, s); else launch_set_fma<T, true>(a, grid, s);   \
+    } else {                                                                      \
+        if (xmx) ok = xmxs::launch<T, false>(a, s); else launch_set_fma<T, false>(a, grid, s); \
+    }
+    DS4_IQ_SWITCH(t, ST_)
+#undef ST_
+    return ok;
 }
 
 // ---------------------------------------------------------------- the busy experts' FP16 weights (f16_rows)

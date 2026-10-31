@@ -43,7 +43,7 @@ b=${BUILD_DIR:-$repo/build-sycl}
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
 # the DeepSeek engine (STRATA_BUILD_DSV41, OFF by default): asking for one of its targets turns it on in this build folder;
 # DSV41=ON / OFF sets it explicitly
-for t in "$@"; do case "$t" in strata-dsv41|ds4_shim_test) DSV41=${DSV41:-ON} ;; esac; done
+for t in "$@"; do case "$t" in strata-dsv41|ds4_shim_test|ds4_xmx_parity) DSV41=${DSV41:-ON} ;; esac; done
 [ -z "${DSV41:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_DSV41="$DSV41" >/dev/null 2>&1
 cmake --build $b -j ${JOBS:-12} ${1:+--target "$@"} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
 rc=${PIPESTATUS[0]}                       # cmake's status, kept: the script ends with this, not with the status of the greps below (#2990)

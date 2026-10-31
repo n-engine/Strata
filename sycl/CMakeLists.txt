@@ -522,5 +522,13 @@ if(STRATA_BUILD_DSV41)
     target_link_libraries(ds4_shim_test PRIVATE strata_core Threads::Threads)
     add_test(NAME ds4_shim_test COMMAND ds4_shim_test)
     set_tests_properties(ds4_shim_test PROPERTIES TIMEOUT 120)   # (a hung kernel fails the test instead of holding the GPU)
+    # the prompt sets' XMX tiles (DS4_XMX=1) against the FMA tiles they replace and a host reference, both timed, on random
+    # expert blocks: ds4_xmx_parity [--types=29,16,17|all] [--rows=...] [--experts=...].  Not a ctest (minutes of GPU time).
+    add_executable(ds4_xmx_parity ${_ds4}/ds4_xmx_parity.cpp ${_ds4}/ds4_iq.dp.cpp ${_ds4}/ds4_tq.dp.cpp)
+    target_include_directories(ds4_xmx_parity PRIVATE ${_ds4} ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include
+                               ${STRATA_ROOT}/third_party/ggml)
+    target_compile_options(ds4_xmx_parity PRIVATE -qmkl=sequential)
+    target_link_options(ds4_xmx_parity PRIVATE -qmkl=sequential)
+    target_link_libraries(ds4_xmx_parity PRIVATE strata_core Threads::Threads)
   endif()
 endif()
