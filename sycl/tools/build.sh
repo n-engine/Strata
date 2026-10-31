@@ -3,6 +3,7 @@
 #   AOT=bmg-g31         ahead-of-time device code (empty: SPIR-V, JIT at the first start)
 #   I8_ESIMD=OFF        no fused int8 ESIMD expert kernels (stubs; the prompt's experts take the XMX path). AUTO (default) or ON otherwise.
 #   ALLOW_BAD_OCLOC=1   build although this ocloc is known to crash on the Battlemage kernels (see below)
+#   DSV41=ON|OFF        the DeepSeek engine (strata-dsv41); ON by itself when strata-dsv41 is a target given here
 set -uo pipefail
 set +u; source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true; set -u
 
@@ -40,6 +41,10 @@ b=${BUILD_DIR:-$repo/build-sycl}
     -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" 2>&1 | tail -15
 # an existing build folder keeps its cache: a switch given now reaches it (only this one, so AOT and the rest stay as configured)
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
+# the DeepSeek engine (STRATA_BUILD_DSV41, OFF by default): asking for one of its targets turns it on in this build folder;
+# DSV41=ON / OFF sets it explicitly
+for t in "$@"; do case "$t" in strata-dsv41|ds4_shim_test) DSV41=${DSV41:-ON} ;; esac; done
+[ -z "${DSV41:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_DSV41="$DSV41" >/dev/null 2>&1
 cmake --build $b -j ${JOBS:-12} ${1:+--target "$@"} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
 rc=${PIPESTATUS[0]}                       # cmake's status, kept: the script ends with this, not with the status of the greps below (#2990)
 echo "BUILD EXIT $rc"

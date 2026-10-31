@@ -475,3 +475,52 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
   endif()
 endif()
+
+# --- DeepSeek-V4.1-Flash (strata-dsv41) ----------------------------------------------------------------------------
+# The DeepSeek engine on Intel GPUs: a full copy of ../src/dsv41 in src/dsv41, built on a CUDA->SYCL shim
+# (src/dsv41/ds4_sycl.hpp; the cuda*.h / mma.h beside it point there).  Started from the community port on the
+# riceharvest/b70 branch and merged forward to upstream's src/dsv41 by a 3-way merge (base: the source that port was
+# made from).  OFF by default: it changes no other target.  sycl/tools/build.sh turns it on when asked for strata-dsv41.
+option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 engine path (strata-dsv41) on SYCL" OFF)
+if(STRATA_BUILD_DSV41)
+  set(_ds4 ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+  add_library(strata_dsv41_kernels STATIC ${_ds4}/vendor/exl3.dp.cpp ${_ds4}/vendor/sampler.dp.cpp ${_ds4}/vendor/moe_win.dp.cpp
+              ${_ds4}/vendor/exl3_cpu.cpp)
+  target_include_directories(strata_dsv41_kernels PUBLIC ${_ds4} ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include
+                             ${STRATA_ROOT}/third_party/ggml)
+  target_link_libraries(strata_dsv41_kernels PUBLIC strata_core)
+  add_executable(strata-dsv41 ${_ds4}/ds4_main.cpp ${_ds4}/ds4_model.dp.cpp ${_ds4}/ds4_kernels.dp.cpp ${_ds4}/ds4_vision.dp.cpp
+                 ${_ds4}/ds4_gguf.dp.cpp ${_ds4}/ds4_gguf_cpu.cpp ${_ds4}/ds4_iq.dp.cpp ${_ds4}/ds4_iq_cpu.cpp ${_ds4}/ds4_tq.dp.cpp
+                 ${_ds4}/ds4_tq_cpu.cpp ${_ds4}/ds4_gg_cpu.cpp ${_ds4}/ds4_packinfo.cpp)
+  # the commit the binary was built from, readable with --version
+  if(NOT STRATA_BUILD_ID AND EXISTS ${STRATA_ROOT}/BUILD_ID)
+    file(STRINGS ${STRATA_ROOT}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
+  endif()
+  if(NOT STRATA_BUILD_ID)
+    execute_process(COMMAND git -C ${STRATA_ROOT} rev-parse --short=9 HEAD OUTPUT_VARIABLE STRATA_BUILD_ID
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  if(NOT STRATA_BUILD_ID)
+    set(STRATA_BUILD_ID unknown)
+  endif()
+  set_source_files_properties(${_ds4}/ds4_main.cpp PROPERTIES COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}-sycl\"")
+  target_include_directories(strata-dsv41 PRIVATE ${_ds4} ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include
+                             ${STRATA_ROOT}/third_party/ggml)
+  target_compile_options(strata-dsv41 PUBLIC -qmkl=sequential)   # (the shim's cuBLAS calls are oneMKL's)
+  target_link_options(strata-dsv41 PUBLIC -qmkl=sequential)
+  target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
+  # the CPU lane's trellis / ggml-type rows (ds4_tq_cpu.cpp, ds4_gg_cpu.cpp) through strata_kernels_cpu, as the top-level
+  # build does; without it both compile to stubs
+  if(STRATA_NATIVE_EXPERTS)
+    target_link_libraries(strata-dsv41 PRIVATE strata_kernels_cpu)
+    target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
+  endif()
+  if(STRATA_SYCL_PARITY)   # the CUDA->SYCL shim's semantics on the device (~300 MB of device memory)
+    add_executable(ds4_shim_test ${_ds4}/ds4_shim_test.cpp)
+    target_include_directories(ds4_shim_test PRIVATE ${_ds4} ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include
+                               ${STRATA_ROOT}/third_party/ggml)
+    target_link_libraries(ds4_shim_test PRIVATE strata_core Threads::Threads)
+    add_test(NAME ds4_shim_test COMMAND ds4_shim_test)
+    set_tests_properties(ds4_shim_test PROPERTIES TIMEOUT 120)   # (a hung kernel fails the test instead of holding the GPU)
+  endif()
+endif()
