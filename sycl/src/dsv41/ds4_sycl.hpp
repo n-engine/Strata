@@ -492,6 +492,7 @@ constexpr unsigned int cudaHostAllocPortable = 1;
 constexpr unsigned int cudaHostAllocMapped = 2;
 constexpr unsigned int cudaHostRegisterPortable = 1;
 constexpr unsigned int cudaHostRegisterMapped = 2;
+constexpr unsigned int cudaHostRegisterReadOnly = 8;   // (a hint here: the registration is bookkeeping, see cudaHostRegister)
 constexpr unsigned int cudaStreamNonBlocking = 1;
 constexpr unsigned int cudaEventDisableTiming = 2;
 
