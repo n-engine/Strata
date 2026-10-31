@@ -84,6 +84,7 @@ public:
         arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
         arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
+        interleave_arena();
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
@@ -522,6 +523,26 @@ private:
             return;
         }
         sp.state.store(kReady, std::memory_order_release);
+    }
+    // DS4_STORE_NUMA=interleave (default off): the arena's pages spread over every NUMA node, as `numactl --interleave=all`
+    // does for the whole process.  On two sockets the CPU lane's threads of both read the store; the first touch puts every
+    // page on the node of the IO thread that filled it.  A failure (EPERM: a container without --cap-add SYS_NICE) is
+    // said once, and the arena stays as it is.
+    void interleave_arena() {
+        const char* v = std::getenv("DS4_STORE_NUMA");
+        if (v == nullptr || std::strcmp(v, "interleave") != 0) return;
+        const std::vector<int> nodes = os::nodes_online();
+        if (nodes.size() < 2) {
+            std::fprintf(stderr, "ds4: DS4_STORE_NUMA=interleave: one NUMA node, nothing to interleave\n");
+            return;
+        }
+        const int e = os::range_interleave(arena_, arena_bytes_, nodes);
+        if (e != 0)
+            std::fprintf(stderr, "ds4: WARNING: DS4_STORE_NUMA=interleave: mbind failed (%s) - the RAM store's pages stay where they "
+                                 "are first touched (a container needs --cap-add SYS_NICE: STRATA_SYCL_NUMA=1)\n", std::strerror(e));
+        else
+            std::fprintf(stderr, "ds4: the RAM store's arena (%.1f GB) interleaved over %zu NUMA nodes (DS4_STORE_NUMA)\n",
+                         (double) arena_bytes_ / 1e9, nodes.size());
     }
     bool grow() {
         if (nalloc_ >= nmax_) return false;

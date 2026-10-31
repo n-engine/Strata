@@ -11,6 +11,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -500,6 +501,43 @@ inline bool range_commit(void* p, size_t bytes) {
     if (::mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) return false;
     ::madvise(p, bytes, thp_advice());
     return true;
+#endif
+}
+/// The NUMA nodes online (Linux, /sys/devices/system/node/online, e.g. "0-1"); empty if the OS does not say.
+inline std::vector<int> nodes_online() {
+    std::vector<int> nodes;
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/sys/devices/system/node/online", "r");
+    if (f == nullptr) return nodes;
+    char line[256] = {0};
+    const bool got = std::fgets(line, sizeof line, f) != nullptr;
+    std::fclose(f);
+    if (!got) return nodes;
+    std::stringstream ss(line);
+    std::string part;
+    while (std::getline(ss, part, ',')) {
+        int a = -1, b = -1;
+        const int n = std::sscanf(part.c_str(), "%d-%d", &a, &b);
+        if (n < 1 || a < 0) continue;
+        if (n < 2) b = a;
+        for (int x = a; x <= b && x < 256; ++x) nodes.push_back(x);
+    }
+#endif
+    return nodes;
+}
+/// [p, p + bytes) of a reserved range spread page by page over `nodes` (mbind MPOL_INTERLEAVE), before any page of it is
+/// touched: the pages committed later keep the policy.  0, or the errno of mbind (EPERM in a container without
+/// CAP_SYS_NICE; ENOSYS off Linux).
+inline int range_interleave(void* p, size_t bytes, const std::vector<int>& nodes) {
+#if defined(__linux__)
+    unsigned long mask[4] = {0, 0, 0, 0};
+    for (int x : nodes)
+        if (x >= 0 && x < 256) mask[x / 64] |= 1ul << (x % 64);
+    if (syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, 256, 0) != 0) return errno;
+    return 0;
+#else
+    (void) p, (void) bytes, (void) nodes;
+    return 38;   // (ENOSYS)
 #endif
 }
 /// A committed piece of a reserved range given back to the system (its address range stays reserved)
