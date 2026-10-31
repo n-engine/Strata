@@ -902,22 +902,34 @@ inline cudaError_t cudaGetDeviceCount(int* count) {
     return cudaSuccess;
 }
 
+// The device's own figures, not one card's: the engine sizes from totalGlobalMem and launches from multiProcessorCount
+// (the Xe-cores, as an SM count).  major 8: the CUDA-side checks see an sm_80-class part (the HIP paths are taken anyway).
+inline int ds4_xe_cores(const sycl::device& d) {
+    if (d.has(sycl::aspect::ext_intel_gpu_slices) && d.has(sycl::aspect::ext_intel_gpu_subslices_per_slice)) {
+        const int n = (int) (d.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+                             d.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>());
+        if (n > 0) return n;
+    }
+    const int eus = (int) d.get_info<sycl::info::device::max_compute_units>();   // (8 EUs an Xe-core on Xe2)
+    return eus >= 8 ? eus / 8 : 1;
+}
 struct cudaDeviceProp {
-    char name[256] = "Intel Arc Pro B70";
-    size_t totalGlobalMem = 32ULL * 1024 * 1024 * 1024;
+    char name[256] = "Intel GPU";
+    size_t totalGlobalMem = 0;
     int major = 8;
     int minor = 9;
-    int multiProcessorCount = 32;
+    int multiProcessorCount = 1;
     int integrated = 0;
 };
 inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int dev_id) {
     if (!prop) return 1;
-    std::strncpy(prop->name, "Intel Arc Pro B70", sizeof(prop->name));
-    prop->totalGlobalMem = 32ULL * 1024 * 1024 * 1024;
-    prop->major = 8;
-    prop->minor = 9;
-    prop->multiProcessorCount = 32;
-    prop->integrated = 0;
+    if (dev_id < 0 || (unsigned) dev_id >= dpct::dev_mgr::instance().device_count()) return 1;
+    const sycl::device& d = dpct::get_device((unsigned) dev_id);
+    *prop = cudaDeviceProp{};
+    std::strncpy(prop->name, d.get_info<sycl::info::device::name>().c_str(), sizeof(prop->name) - 1);
+    prop->totalGlobalMem = (size_t) d.get_info<sycl::info::device::global_mem_size>();
+    prop->multiProcessorCount = ds4_xe_cores(d);
+    prop->integrated = d.get_info<sycl::info::device::host_unified_memory>() ? 1 : 0;
     return cudaSuccess;
 }
 
@@ -929,9 +941,11 @@ enum cudaDeviceAttr {
 };
 inline cudaError_t cudaDeviceGetAttribute(int* val, cudaDeviceAttr attr, int dev_id) {
     if (attr == cudaDevAttrComputeCapabilityMajor) *val = 8;
-    else if (attr == cudaDevAttrMultiProcessorCount) *val = 32;
-    else if (attr == cudaDevAttrIntegrated) *val = 0;
-    else if (attr == cudaDevAttrMaxSharedMemoryPerBlockOptin) *val = 64 * 1024;
+    else if (attr == cudaDevAttrMultiProcessorCount || attr == cudaDevAttrIntegrated) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev_id) != cudaSuccess) { *val = 0; return 1; }
+        *val = attr == cudaDevAttrMultiProcessorCount ? p.multiProcessorCount : p.integrated;
+    } else if (attr == cudaDevAttrMaxSharedMemoryPerBlockOptin) *val = 64 * 1024;
     else *val = 0;
     return cudaSuccess;
 }
