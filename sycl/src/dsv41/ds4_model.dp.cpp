@@ -37,6 +37,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include "strata/copy_queue.hpp"   // DS4_COPY_ENGINE: the flow's copy stream on the GPU's copy engine
 
 #if defined(STRATA_METAL)
 extern "C" void ds4_busy_begin();
@@ -598,6 +599,43 @@ __global__ void pred_proj_k(const float* x, int D, float* out) {
         a += (h & 1u) ? xr[d] : -xr[d];
     }
     out[(size_t) t * 256 + j] = a * rsqrtf((float) D);
+}
+
+// DS4_COPY_ENGINE=1 (opt-in, off by default): the flow's copy stream (Chunk::cs) is a queue on the GPU's copy-only engine
+// (strata::make_copy_engine_queue, src/core/copy_queue.cpp, the Qwen prompt path's) instead of a plain in-order queue.  Under
+// the Level Zero v2 adapter a plain queue runs on the compute engine, so the expert DMA and the kernels are serialized there.
+// Everything the flow puts on Chunk::cs is a copy (cudaMemcpyAsync, cudaMemcpy2DAsync: queue::memcpy only, no kernel), a
+// barrier (cudaEventRecord, cudaStreamWaitEvent: ext_oneapi_submit_barrier) or a host wait / query, which a copy-only queue
+// runs; no kernel, memset or fill goes there.  The queue is shared per device and never freed: it is registered with the
+// shim's queues (so cudaDeviceSynchronize / cudaFree wait for it) and ds4_copy_stream_destroy unregisters it without deleting
+// it.  nullptr from make_copy_engine_queue (no Level Zero, no copy-only group, STRATA_COPY_ENGINE=0): today's queue.
+static bool ds4_copy_engine_wanted() {
+    static const bool on = [] { const char* v = std::getenv("DS4_COPY_ENGINE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+static cudaError_t ds4_copy_stream_create(cudaStream_t* s, bool* on_copy_engine) {
+    *on_copy_engine = false;
+    if (ds4_copy_engine_wanted()) {
+        if (sycl::queue* q = strata::make_copy_engine_queue("the DeepSeek prompt flow's expert")) {
+            std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+            auto& v = ds4_shim::st().queues;
+            if (std::find(v.begin(), v.end(), q) == v.end()) v.push_back(q);
+            *s = q;
+            *on_copy_engine = true;
+            return cudaSuccess;
+        }
+    }
+    return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+}
+static void ds4_copy_stream_destroy(cudaStream_t s) {
+    if (ds4_copy_engine_wanted() && strata::is_copy_engine_queue(s)) {   // (shared, never freed: idle and unregistered only)
+        s->wait();
+        std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+        auto& v = ds4_shim::st().queues;
+        v.erase(std::remove(v.begin(), v.end(), s), v.end());
+        return;
+    }
+    cudaStreamDestroy(s);
 }
 
 struct Chunk {
@@ -2931,7 +2969,7 @@ struct Model::Impl {
                     cudaDeviceSynchronize();
                     if (di < chunks.size() && chunks[di]) {
                         if (chunks[di]->blas) cublasDestroy(chunks[di]->blas);
-                        if (chunks[di]->cs) cudaStreamDestroy(chunks[di]->cs);
+                        if (chunks[di]->cs) ds4_copy_stream_destroy(chunks[di]->cs);
                     }
                     while (d.allocs.size() > na0[di]) {
                         cudaFree(d.allocs.back());
@@ -3390,7 +3428,15 @@ struct Model::Impl {
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
             }
-            CK(cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking));
+            if (!ds4_copy_engine_wanted()) {
+                CK(cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking));
+            } else {
+                bool ce = false;
+                CK(ds4_copy_stream_create(&c.cs, &ce));
+                if (di == 0 && o.verbose)   // (once: the first device; the others take the same path)
+                    std::fprintf(stderr, "ds4: CUDA%d: DS4_COPY_ENGINE=1: the flow's expert copies %s\n", d.id,
+                                 ce ? "run on the GPU's copy engine" : "stay on an ordinary queue (no copy engine queue)");
+            }
             for (int i = 0; i < Chunk::kParts; ++i) {
                 CK(cudaEventCreateWithFlags(&c.filled[i], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&c.freed[i], cudaEventDisableTiming));

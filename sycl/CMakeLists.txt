@@ -491,7 +491,8 @@ if(STRATA_BUILD_DSV41)
   target_link_libraries(strata_dsv41_kernels PUBLIC strata_core)
   add_executable(strata-dsv41 ${_ds4}/ds4_main.cpp ${_ds4}/ds4_model.dp.cpp ${_ds4}/ds4_kernels.dp.cpp ${_ds4}/ds4_vision.dp.cpp
                  ${_ds4}/ds4_gguf.dp.cpp ${_ds4}/ds4_gguf_cpu.cpp ${_ds4}/ds4_iq.dp.cpp ${_ds4}/ds4_iq_cpu.cpp ${_ds4}/ds4_tq.dp.cpp
-                 ${_ds4}/ds4_tq_cpu.cpp ${_ds4}/ds4_gg_cpu.cpp ${_ds4}/ds4_packinfo.cpp)
+                 ${_ds4}/ds4_tq_cpu.cpp ${_ds4}/ds4_gg_cpu.cpp ${_ds4}/ds4_packinfo.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp)   # DS4_COPY_ENGINE: the flow's copy stream on the copy engine
   # the commit the binary was built from, readable with --version
   if(NOT STRATA_BUILD_ID AND EXISTS ${STRATA_ROOT}/BUILD_ID)
     file(STRINGS ${STRATA_ROOT}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
