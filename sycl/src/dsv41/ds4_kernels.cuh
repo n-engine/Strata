@@ -165,6 +165,14 @@ struct AttnRows {
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+#if defined(SYCL_LANGUAGE_VERSION)
+/// DS4_FAST_ATTN=1's kernel on Intel's XMX units (SYCL only; sparse_attn takes it for the chunked prompt when the variable is
+/// set), callable directly (ds4_attn_parity): packed rows (kKvFp4), d 512, 16 heads a work-group.  The outputs differ from
+/// the scalar kernel's in the last places (FP16 operands, another order of the sums).  false: not launched (heads not a
+/// multiple of 16, T < 1, or less local memory than it takes).
+bool sparse_attn_xmx(const float* q, const uint16_t* win, const uint8_t* ckv, const int* sel, int sel_stride, const AttnRows& a,
+                     const float* sink, int heads, int T, float scale, float* out, cudaStream_t s);
+#endif
 /// The window buffer: ext[r] = ring[(p0 - n + r) % n] for the n rows before p0 (zeros before position 0); afterwards
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:

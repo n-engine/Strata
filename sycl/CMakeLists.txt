@@ -530,5 +530,13 @@ if(STRATA_BUILD_DSV41)
     target_compile_options(ds4_xmx_parity PRIVATE -qmkl=sequential)
     target_link_options(ds4_xmx_parity PRIVATE -qmkl=sequential)
     target_link_libraries(ds4_xmx_parity PRIVATE strata_core Threads::Threads)
+    # the chunked prompt's XMX attention (DS4_FAST_ATTN=1) against the scalar kernel it replaces and a host reference, both
+    # timed, at DeepSeek V4.1's attention shapes: ds4_attn_parity [--t=...] [--p0=...] [--ratio=...] [--qstd=...].  Not a ctest.
+    add_executable(ds4_attn_parity ${_ds4}/ds4_attn_parity.cpp ${_ds4}/ds4_kernels.dp.cpp)
+    target_include_directories(ds4_attn_parity PRIVATE ${_ds4} ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include
+                               ${STRATA_ROOT}/third_party/ggml)
+    target_compile_options(ds4_attn_parity PRIVATE -qmkl=sequential)
+    target_link_options(ds4_attn_parity PRIVATE -qmkl=sequential)
+    target_link_libraries(ds4_attn_parity PRIVATE strata_core Threads::Threads)
   endif()
 endif()

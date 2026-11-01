@@ -15,6 +15,8 @@
 
 #include "ds4_sycl.hpp"
 
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -1303,6 +1305,206 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
 }
 #endif   // STRATA_USE_HIP
 
+// ---------------------------------------------------------------- DS4_FAST_ATTN=1 on Intel's XMX units (SYCL)
+// sparse_attn_wmma_kernel's design on joint_matrix: the matrix's rows are 16 heads of ONE query, a work-group stages a 16-key
+// tile once for all of them, Q (16 heads x 512 dims, FP16) is the A operand of the scores' product, the key tile is B, and the
+// same tile is B of the values' product.  The same online softmax a 16-key tile (the running max, the tile's rescale, the
+// sink in the denominator at the end), the same FP16 operands (Q and the keys rounded from F32 / BF16, P rounded from F32),
+// FP32 accumulation; only the order of the sums differs from sparse_attn_packed_kernel's - hence opt-in.
+//   A work-group: 16 sub-groups of 16 (Xe2's XMX width; the project's default is 32), joint_matrix 8x16x16 (two 8-head A tiles).
+//   Staging: work item (cp = tid % 8, piece = tid / 8) decodes 16 dims of keys 2 cp and 2 cp + 1 (a window row's BF16, or a
+//   packed row's E2M1 codes times their E4M3 scale: unpack32's values, exact in BF16 and in FP16) and writes them twice, in the
+//   ext_intel_packed layouts of the two B operands: K^T as word (dims 2i, 2i + 1 of key k) at kp[i][k], V as word (keys 2c,
+//   2c + 1 of dim d) at vp[c][d].  Keys past the last are zeros (their scores are -inf, their P 0).
+//   Scores: sub-group s takes dims [32 s, +32) for both 8-head tiles (its Q tiles stay in registers for the whole pass), the
+//   16 partial 16x16 products are summed in local memory in a fixed order.  Softmax: sub-group h is head h, a lane a key.
+//   Values: sub-group s owns the accumulators of dims [32 s, +32) x 16 heads (2 x 2 tiles of 8 x 16), rescaled by the tile's
+//   factor per row (joint_matrix_apply with the element's row; skipped when every factor is 1), stored once at the end.
+namespace xmxa {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+namespace jmi = sycl::ext::intel::experimental::matrix;
+constexpr int kSg = 16, kNsg = 16, kWg = kSg * kNsg;   // the sub-group the XMX units take, sub-groups a work-group
+constexpr int kHeads = 16, kKeys = 16, kD = 512;      // heads a work-group (the A rows), keys a tile, the head dim
+constexpr int kQLd = kD + 8;                           // halves a Q staging row (padded)
+constexpr int kKLd = kKeys;                            // words a K^T pair-row (dims 2i, 2i + 1 of the tile's keys)
+constexpr int kVLd = kD + 8;                           // words a V pair-row (keys 2c, 2c + 1 of every dim; padded)
+constexpr int kPLd = kKeys;                            // halves a P row
+constexpr int kOffKp = 0;
+constexpr int kOffVp = kOffKp + (kD / 2) * kKLd * 4;
+constexpr int kOffPart = kOffVp + (kKeys / 2) * kVLd * 4;   // the scores' partial products: kNsg x 16 x 16 floats
+constexpr int kOffP = kOffPart + kNsg * kHeads * kKeys * 4;
+constexpr int kOffTs = kOffP + kHeads * kPLd * 2;          // the tile's rescale per head, then the final denominators
+constexpr int kSlm = kOffTs + 2 * kHeads * 4;
+static_assert(kHeads * kQLd * 2 <= kOffPart, "the Q staging fits in the K and V tiles (used before the first tile)");
+static_assert(kSlm % 16 == 0 && kD / kNsg == 32 && kWg == 8 * (kD / 16), "the layout above");
+
+template <typename T>
+inline auto lptr(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+}
+inline uint32_t h2w(float lo, float hi) {   // two values rounded to FP16 as one word (lo at the lower address)
+    return (uint32_t) sycl::bit_cast<uint16_t>(sycl::half(lo)) | (uint32_t) sycl::bit_cast<uint16_t>(sycl::half(hi)) << 16;
+}
+
+inline void body(const float* __restrict__ q, const uint16_t* __restrict__ win, const uint8_t* __restrict__ ckv,
+                 const int* __restrict__ sel, int sel_stride, const AttnRows& ar, const float* __restrict__ sink, int heads,
+                 float scale, float* __restrict__ out, const sycl::nd_item<2>& it, uint8_t* slm) {
+    auto sg = it.get_sub_group();
+    const int tid = (int) it.get_local_id(1), sgid = (int) sg.get_group_linear_id(), ln = (int) sg.get_local_linear_id();
+    const int t = (int) it.get_group(0), hb = (int) it.get_group(1) * kHeads;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long fw = (long long) ar.win - ar.p0, first = fw > ta + 1 ? fw : ta + 1;
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        const long long ns = ar.R > 0 ? (pa + 1) / ar.R : 0;
+        n_sel = (int) (ns < (long long) ar.kcap ? ns : (long long) ar.kcap);
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * kD;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, kD);
+    uint32_t* kp = reinterpret_cast<uint32_t*>(slm + kOffKp);
+    uint32_t* vp = reinterpret_cast<uint32_t*>(slm + kOffVp);
+    float* part = reinterpret_cast<float*>(slm + kOffPart);
+    sycl::half* ps = reinterpret_cast<sycl::half*>(slm + kOffP);
+    float* ts = reinterpret_cast<float*>(slm + kOffTs);
+    float* fin = ts + kHeads;
+    // the work-group's 16 heads' queries as FP16, then this sub-group's dims [32 sgid, +32) of both 8-head tiles in registers
+    sycl::half* qs = reinterpret_cast<sycl::half*>(slm);
+    for (int i = tid; i < kHeads * kD; i += kWg) {
+        const int h = i / kD, c = i % kD;
+        qs[h * kQLd + c] = sycl::half(q[((size_t) t * heads + hb + h) * kD + c]);
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> qa[2][2];
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) jm::joint_matrix_load(sg, qa[m][j], lptr(qs + m * 8 * kQLd + sgid * 32 + j * 16), kQLd);
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> o[2][2];   // heads [8 m, +8) x dims [32 sgid + 16 n, +16)
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) jm::joint_matrix_fill(sg, o[m][n], 0.0f);
+    float m_run = -1e30f, den = 0.0f;   // head sgid's running max and denominator (uniform in the sub-group)
+    it.barrier(sycl::access::fence_space::local_space);   // (every Q tile loaded before the first staging overwrites them)
+    const int cp = tid & 7, piece = tid >> 3;
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += kKeys) {
+        const int nt = total - t0 < kKeys ? total - t0 : kKeys;
+        {   // the tile: dims [16 piece, +16) of keys 2 cp, 2 cp + 1
+            float v[2][16];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int j = t0 + 2 * cp + e;
+                if (j >= total) {
+#pragma unroll
+                    for (int x = 0; x < 16; ++x) v[e][x] = 0.0f;
+                } else if (j < n_win) {   // a window row: BF16 already
+                    const uint16_t* src = wbase + (size_t) j * kD + piece * 16;
+                    const sycl::vec<uint16_t, 8> a = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(src);
+                    const sycl::vec<uint16_t, 8> b = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(src + 8);
+#pragma unroll
+                    for (int x = 0; x < 8; ++x) {
+                        v[e][x] = bf16f(a[x]);
+                        v[e][8 + x] = bf16f(b[x]);
+                    }
+                } else {   // a packed row: 8 code bytes (values 2i low nibble, 2i + 1 high) and their group's E4M3 scale, as unpack32
+                    const uint8_t* rr = ckv + (size_t) sl[j - n_win] * crow;
+                    const sycl::vec<uint32_t, 2> cw = *reinterpret_cast<const sycl::vec<uint32_t, 2>*>(rr + piece * 8);
+                    const float ks = e4m3_value(rr[256 + piece]) * 16384.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const uint32_t b = cw[i >> 2] >> (8 * (i & 3));
+                        const float lo = e2m1_val14(b) * ks, hi = e2m1_val14(b >> 4) * ks;   // (exact: their BF16 bits)
+                        v[e][2 * i] = __uint_as_float(__float_as_uint(lo) & 0xffff0000u);
+                        v[e][2 * i + 1] = __uint_as_float(__float_as_uint(hi) & 0xffff0000u);
+                    }
+                }
+            }
+#pragma unroll
+            for (int e = 0; e < 2; ++e)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) kp[(piece * 8 + i) * kKLd + 2 * cp + e] = h2w(v[e][2 * i], v[e][2 * i + 1]);
+            sycl::vec<uint32_t, 4>* vd = reinterpret_cast<sycl::vec<uint32_t, 4>*>(vp + cp * kVLd + piece * 16);
+#pragma unroll
+            for (int x = 0; x < 4; ++x)
+                vd[x] = sycl::vec<uint32_t, 4>(h2w(v[0][4 * x], v[1][4 * x]), h2w(v[0][4 * x + 1], v[1][4 * x + 1]),
+                                               h2w(v[0][4 * x + 2], v[1][4 * x + 2]), h2w(v[0][4 * x + 3], v[1][4 * x + 3]));
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // the scores: this sub-group's 32 dims of both 8-head tiles into part[sgid]
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> s0, s1;
+            jm::joint_matrix_fill(sg, s0, 0.0f);
+            jm::joint_matrix_fill(sg, s1, 0.0f);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int kk = sgid * 32 + j * 16;
+                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> kb;
+                jm::joint_matrix_load(sg, kb, lptr(reinterpret_cast<sycl::half*>(kp) + (kk / 2) * (2 * kKLd)), 2 * kKLd);
+                jm::joint_matrix_mad(sg, s0, qa[0][j], kb, s0);
+                jm::joint_matrix_mad(sg, s1, qa[1][j], kb, s1);
+            }
+            jm::joint_matrix_store(sg, s0, lptr(part + sgid * 256), 16, jm::layout::row_major);
+            jm::joint_matrix_store(sg, s1, lptr(part + sgid * 256 + 128), 16, jm::layout::row_major);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // the online softmax: sub-group h is head h, lane k key k
+            const int h = sgid, k = ln;
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kNsg; ++w) a += part[w * 256 + h * 16 + k];
+            const float sc = k < nt ? a * scale : -INFINITY;
+            const float m = sycl::reduce_over_group(sg, sc, sycl::maximum<float>());
+            const float mn = sycl::fmax(m_run, m);
+            const float p = sycl::exp(sc - mn);
+            ps[h * kPLd + k] = sycl::half(p);
+            const float s = sycl::reduce_over_group(sg, p, sycl::plus<float>());
+            const float f = sycl::exp(m_run - mn);
+            den = den * f + s;
+            m_run = mn;
+            if (k == 0) ts[h] = f;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // the values: o = o * ts (per head) + P (16 heads x 16 keys) x V (16 keys x this sub-group's 32 dims)
+            if (sycl::any_of_group(sg, ts[ln] != 1.0f)) {
+#pragma unroll
+                for (int m = 0; m < 2; ++m)
+#pragma unroll
+                    for (int n = 0; n < 2; ++n)
+                        jmi::joint_matrix_apply(sg, o[m][n], [=](float& x, size_t r, size_t) { x *= ts[m * 8 + (int) r]; });
+            }
+            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> pa[2];
+#pragma unroll
+            for (int m = 0; m < 2; ++m) jm::joint_matrix_load(sg, pa[m], lptr(ps + m * 8 * kPLd), kPLd);
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> vb;
+                jm::joint_matrix_load(sg, vb, lptr(reinterpret_cast<sycl::half*>(vp) + (sgid * 32 + n * 16) * 2), 2 * kVLd);
+                jm::joint_matrix_mad(sg, o[0][n], pa[0], vb, o[0][n]);
+                jm::joint_matrix_mad(sg, o[1][n], pa[1], vb, o[1][n]);
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);   // (the next tile's staging overwrites kp, vp and P)
+    }
+    if (ln == 0) fin[sgid] = den + sycl::exp(sink[hb + sgid] - m_run);
+    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            jmi::joint_matrix_apply(sg, o[m][n], [=](float& x, size_t r, size_t) { x = x / fin[m * 8 + (int) r]; });
+            float* dst = out + ((size_t) t * heads + hb + m * 8) * kD + sgid * 32 + n * 16;
+            jm::joint_matrix_store(sg, o[m][n],
+                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(dst), kD,
+                jm::layout::row_major);
+        }
+}
+}  // namespace xmxa
+
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
                                    int d) {
@@ -2071,6 +2273,16 @@ bool fast_attn_enabled() {
     return strata::ds4::fast_attn_default(env, false, strata::ds4::defaults_026());
 #endif
 }
+#if defined(SYCL_LANGUAGE_VERSION)
+// (the one line at the start of the program when it is on: on SYCL only DS4_FAST_ATTN=1 turns it on)
+[[maybe_unused]] const bool g_fast_attn_note = [] {
+    if (fast_attn_enabled())
+        std::fprintf(stderr, "ds4 kernels: DS4_FAST_ATTN=1: the chunked prompt's packed-KV attention runs on the XMX units "
+                             "(joint_matrix 8x16x16, FP16 in, FP32 accumulate; %d heads x %d-key tiles, sub-group %d)\n",
+                     xmxa::kHeads, xmxa::kKeys, xmxa::kSg);
+    return true;
+}();
+#endif
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
     static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
@@ -2404,6 +2616,26 @@ static int sm_count() {
     return v;
 }
 
+#if defined(SYCL_LANGUAGE_VERSION)
+bool sparse_attn_xmx(const float* q, const uint16_t* win, const uint8_t* ckv, const int* sel, int sel_stride, const AttnRows& a,
+                     const float* sink, int heads, int T, float scale, float* out, cudaStream_t s) {
+    if (T <= 0 || heads <= 0 || heads % xmxa::kHeads != 0) return false;
+    sycl::queue& qq = *strata::q_of(s);
+    static const bool fits = qq.get_device().get_info<sycl::info::device::local_mem_size>() >= (size_t) xmxa::kSlm;
+    if (!fits) return false;
+    const sycl::nd_range<2> nd(sycl::range<2>((size_t) T, (size_t) (heads / xmxa::kHeads) * xmxa::kWg),
+                               sycl::range<2>(1, xmxa::kWg));
+    const AttnRows ar = a;   // (by value to the device)
+    qq.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::uint4, 1> slm(sycl::range<1>(xmxa::kSlm / 16), h);
+        h.parallel_for(nd, [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(xmxa::kSg)]] {
+            xmxa::body(q, win, ckv, sel, sel_stride, ar, sink, heads, scale, out, it, reinterpret_cast<uint8_t*>(&slm[0]));
+        });
+    });
+    return true;
+}
+#endif
+
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
@@ -2464,6 +2696,14 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                                                                               a, sink, heads, scale, out);
         return;
     }
+#endif
+#if defined(SYCL_LANGUAGE_VERSION)
+    // DS4_FAST_ATTN=1 on SYCL: the same path on Intel's XMX units (xmxa above, opt-in; unset, nothing below changes).  Only
+    // for heads_per_block 0, the engine's prompt call: a caller that asks for G heads a block (the parity test) keeps the
+    // scalar kernel.
+    if (fast_attn_enabled() && heads_per_block == 0 && a.gen != 0 && T >= xmxa::kKeys &&
+        sparse_attn_xmx(q, win, (const uint8_t*) ckv, sel, sel_stride, a, sink, heads, T, scale, out, s))
+        return;
 #endif
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
     int G = heads_per_block;    if (G != 1 && G != 2 && G != 4 && G != 8) {
