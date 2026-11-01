@@ -32,6 +32,7 @@ the same slot, never from runs on different days.
 | Prompt, 64K and 128K tokens, all switches | 414 tokens/s (154 s and 309 s) |
 | Output after a short prompt, quiet machine | 10.7 to 11.1 tokens/s |
 | Output after a 16K prompt | 9.9 to 10.2 tokens/s |
+| Output after a 64K prompt, 256 tokens | 10.6 tokens/s |
 | Output with the DSpark drafter (`--dspark on`), code prompt | 10.9 to 11.5 tokens/s, against 9.9 without (+14%) |
 | Output, 384 tokens, short prompt, RAM store NUMA-interleaved | 14.97 tokens/s (interleave: +24% on the same binary) |
 | A conversation's next turn (prefix reuse, `--serve`) | first word after 1.0 to 1.7 s instead of 87.5 s |
@@ -105,4 +106,7 @@ The DSpark drafter needs a pack that includes it. Build it with setup's recipe (
 - Each prompt pass streams all the routed experts to the card once, about 21 s here whatever the length. A message of a
   few hundred tokens pays it in full.
 - Output speed depends on the memory bandwidth the CPU part gets. Another program reading memory hard cost 21% to 27% here.
-- A short answer right after a 64K or 128K prompt came out at about 2.4 tokens/s (28 tokens in 12 s). Not understood yet.
+- After a 64K prompt the output runs at the normal speed (256 tokens at 10.6 tokens/s, against 11.0 after a 149-token
+  prompt). The first 30 or so tokens after any prompt come at about 8 tokens/s. A 28-token answer after 64K and 128K was
+  timed at about 2.4 tokens/s: the engine's own decode time for such a short answer includes a few seconds that the
+  per-token gaps do not show; where they go is not known yet.
