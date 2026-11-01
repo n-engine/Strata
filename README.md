@@ -1,3 +1,5 @@
+> **Fork note (branch `dsv41-sycl`):** this fork runs Strata's DeepSeek V4.1-Flash engine on an Intel Arc card through SYCL (measured on one Arc Pro B60: prompts up to 414 tokens/s, logits matching the CUDA engine within run-to-run noise). Not part of upstream Strata. What it is, how to build and run it, the numbers and the limits: [docs/INTEL_DEEPSEEK.md](docs/INTEL_DEEPSEEK.md). Upstream: [Niko1221/Strata](https://github.com/Niko1221/Strata).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

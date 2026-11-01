@@ -8,7 +8,7 @@ OpenAI and Anthropic APIs, streaming, tool calls, MCP and the web app are unchan
 no shared upstream file is changed. `sycl/setup_intel.py` and `sycl/serve/server_intel.py` wrap upstream's `setup.py` and
 `serve/server.py` from outside. llama.cpp's SYCL backend runs the same GGUF at about a third of the speed.
 
-DeepSeek V4.1-Flash does not run on Intel. Pictures are on by default ([below](#pictures-on-an-arc)).
+DeepSeek V4.1-Flash does not run on Intel in upstream Strata; this branch adds a SYCL build of it ([INTEL_DEEPSEEK.md](INTEL_DEEPSEEK.md)). Pictures are on by default ([below](#pictures-on-an-arc)).
 
 ## Quick start
 
